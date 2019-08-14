@@ -44,26 +44,8 @@ sub main {
 
 sub pretty_sym {
     my $sym = shift @_;
-
-=pod
-    state $cppfilt_pid;
-    state $cppfilt_in;
-    state $cppfilt_out;
-    if (! defined $cppfilt_pid) {
-        open2($cppfilt_out, $cppfilt_in, '/usr/bin/c++filt')
-            or die $!;
-    }
-    END {
-        waitpid $cppfilt_pid, 0
-            if defined $cppfilt_pid;
-    }
-
-
-    local $| = 1;
-    say $cppfilt_in $sym;
-    return <$cppfilt_out>;
-=cut
     chomp(my $pretty = qx{c++filt $sym});
+    die "c++filt error" unless $? == 0;
     return $pretty;
 }
 
@@ -84,11 +66,11 @@ sub parse_ar_file {
 
         if ($sym_type =~ /^[u]$/i) {
             push @{$obj_needs{$obj_fn}}, $sym_name;
-            #        push @{$sym_needed_by{$sym_name}}, $obj_fn;
+            #push @{$sym_needed_by{$sym_name}}, $obj_fn;
         }
         elsif ($sym_type =~ /^[vw]$/i) {
             # weak symbol, ignore
-            warn ": ignoring weak symbol ", pretty_sym($sym_name), " in $obj_fn\n";
+            #warn ": ignoring weak symbol ", pretty_sym($sym_name), " in $obj_fn\n";
         }
         else {
             push @{$obj_provides{$obj_fn}}, $sym_name;
@@ -143,14 +125,25 @@ sub write_dot {
 
     my $fh = openFileW($dot_fn);
 
-    say $fh 'digraph "', basename($ar_fn), '" {';
-    for my $v (@$V) {
-        say $fh qq("$v";);
-    }
-    while (my ($v, $ws) = each %$E) {
-        for my $w (@$ws) {
-            say $fh qq("$v" -> "$w";);
+    my @sccs = tarjan_scc($V, $E);
+
+    say $fh 'strict digraph "', basename($ar_fn), '" {';
+    say $fh 'rankdir BT';
+
+    my $i = 0;
+    for my $scc (@sccs) {
+        ++$i;
+        say $fh "subgraph cluster$i {"
+            if @$scc > 1;
+        for my $v (@$scc) {
+            say $fh qq("$v";);
         }
+        say $fh "}"
+            if @$scc > 1;
+    }
+
+    while (my ($v, $ws) = each %$E) {
+        say $fh qq("$v" -> {), join(" ", map qq("$_"), @$ws), '};';
     }
     say $fh "}";
 }
@@ -243,8 +236,7 @@ sub tarjan_scc {
 
     for my $v (@$V) {
         if (! exists $index_of{$v}) {
-            my @res = $strongconnect->($v);
-            push @sccs, @res;
+            push @sccs, $strongconnect->($v);
         }
     }
 
