@@ -5,36 +5,71 @@ use warnings;
 
 use File::Basename;
 use IPC::Open2;
-use List::Util qw(min);
+use List::Util qw(min any);
 use Getopt::Long;
 
 sub usage {
-    "$0 [ --dot=<output.dot> ] [ --sccs=<output> ] <library.a>\n" .
+    "$0 [ --dot=<output.dot> ] [ --sccs=<output> ] [ --print-external-dependencies ] <library.a> [ <another-library.a> ... ]\n" .
     "if neither --dot nor --sccs is given, defaults to --sccs=- (stdout)\n"
 }
+
+# TODO an option that does subgraphs based on the libraries, rather than the
+# sccs, might be nice.
 
 main();
 
 sub main {
     my $dot_fn;
     my $scc_fn;
+    my $opts = {
+        print_external_deps => '',
+    };
     GetOptions (
         "dot=s"  => \$dot_fn,
         "sccs=s"  => \$scc_fn,
+        "print-external-dependencies"  => \$opts->{print_external_deps},
     ) or die usage();
 
     if (! defined $dot_fn && ! defined $scc_fn) {
         $scc_fn = "-";
     }
 
-    die usage() unless @ARGV == 1;
+    die usage() unless @ARGV >= 1;
 
-    my $ar_fn = shift @ARGV;
+    my @libraries = @ARGV;
+    @ARGV = ();
 
-    my ($V, $E) = parse_ar_file($ar_fn);
+    my (%obj_files, %obj_needs, %obj_provides, %sym_provided_by);
+
+    for my $ar_fn (@libraries) {
+        # TODO Maybe its better to parse the (possibly non-empty) result hashes
+        # via reference to parse_ar_file, so it can handle duplicates directly.
+        my ($loc_obj_files, $loc_obj_needs, $loc_obj_provides, $loc_sym_provided_by)
+            = parse_ar_file($ar_fn, $opts);
+
+        die "Object file(s) with the same name already encountered, when reading $ar_fn: "
+            . join ", ", grep { exists $obj_files{$_} } keys %$loc_obj_files
+            if any { exists $obj_files{$_} } keys %$loc_obj_files;
+        @obj_files{keys %$loc_obj_files} = values %$loc_obj_files;
+
+        die "Object file with the same name already encountered, when reading $ar_fn"
+            if any { exists $obj_needs{$_} } keys %$loc_obj_needs;
+        @obj_needs{keys %$loc_obj_needs} = values %$loc_obj_needs;
+
+        die "Object file with the same name already encountered, when reading $ar_fn"
+            if any { exists $obj_provides{$_} } keys %$loc_obj_provides;
+        @obj_provides{keys %$loc_obj_provides} = values %$loc_obj_provides;
+
+        die "Symbol already encountered, when reading $ar_fn"
+            if any { exists $sym_provided_by{$_} } keys %$loc_sym_provided_by;
+        @sym_provided_by{keys %$loc_sym_provided_by} = values %$loc_sym_provided_by;
+    }
+
+    my ($V, $E) = create_graph(\%obj_files, \%obj_needs, \%obj_provides, \%sym_provided_by, $opts);
 
     if (defined $dot_fn) {
-        write_dot($dot_fn, $V, $E, $ar_fn);
+        my $graph_name = join ",", map basename($_), @libraries;
+        write_dot($dot_fn, $V, $E, $graph_name);
     }
 
     if (defined $scc_fn) {
@@ -50,7 +85,7 @@ sub pretty_sym {
 }
 
 sub parse_ar_file {
-    my $ar_fn = shift;
+    my ($ar_fn, $opts) = @_;
 
     open my $ar_nm_out, "-|", qw{ /usr/bin/nm -og }, $ar_fn
         or die "Failed to execute nm -og $ar_fn: $!\n";
@@ -62,47 +97,66 @@ sub parse_ar_file {
     #my %sym_needed_by;
 
     my $add_obj_sym = sub {
-        my ($sym_type, $obj_fn, $sym_name) = @_;
+        my ($sym_type, $obj_id, $sym_name) = @_;
 
         if ($sym_type =~ /^[u]$/i) {
-            push @{$obj_needs{$obj_fn}}, $sym_name;
-            #push @{$sym_needed_by{$sym_name}}, $obj_fn;
+            push @{$obj_needs{$obj_id}}, $sym_name;
+            #push @{$sym_needed_by{$sym_name}}, $obj_id;
         }
         elsif ($sym_type =~ /^[vw]$/i) {
             # weak symbol, ignore
-            #warn ": ignoring weak symbol ", pretty_sym($sym_name), " in $obj_fn\n";
+            #warn ": ignoring weak symbol ", pretty_sym($sym_name), " in $obj_id\n";
         }
         else {
-            push @{$obj_provides{$obj_fn}}, $sym_name;
-            warn "Duplicate symbol ", pretty_sym($sym_name), ":\n$sym_provided_by{$sym_name}, $obj_fn (type $sym_type)\n"
+            push @{$obj_provides{$obj_id}}, $sym_name;
+            warn "Duplicate symbol ", pretty_sym($sym_name), ":\n$sym_provided_by{$sym_name}, $obj_id (type $sym_type)\n"
                 if exists $sym_provided_by{$sym_name};
-            $sym_provided_by{$sym_name} = $obj_fn;
+            $sym_provided_by{$sym_name} = $obj_id;
         }
     };
+
+    my %obj_files;
 
     while (my $ln = <$ar_nm_out>) {
         chomp $ln;
         my ($ar_path, $obj_fn, $sym_ln) = split /:/, $ln, 3;
+        # Try to make object file names a little more unique, as there may be
+        # different object files with the same name. This is harder if it
+        # happens in the same archive...
+        my $obj_id = join "/", basename($ar_path), $obj_fn;
+        $obj_files{$obj_id} = 1;
         my ($sym_value, $sym_type, $sym_name) = split /\s+/, $sym_ln, 3;
         die "Failed to parse:\n$ln"
             unless $sym_type =~ /^[a-zA-Z?-]$/;
 
-        $add_obj_sym->($sym_type, $obj_fn, $sym_name);
+        $add_obj_sym->($sym_type, $obj_id, $sym_name);
     }
 
-# Create vertices
-    my %objs;
-    @objs{keys %obj_needs} = (1) x keys %obj_needs;
-    @objs{keys %obj_provides} = (1) x keys %obj_provides;
+    return (\%obj_files, \%obj_needs, \%obj_provides, \%sym_provided_by);
+}
 
-    my @V = keys %objs;
+sub create_graph {
+    my ($obj_files, $obj_needs, $obj_provides, $sym_provided_by, $opts) = @_;
+
+# Create vertices
+    my @V = do {
+        if ($opts->{print_external_deps}) {
+            my %all_objs = %$obj_files;
+            @all_objs{keys %$obj_needs} = (1) x keys %$obj_needs;
+            @all_objs{keys %$obj_provides} = (1) x keys %$obj_provides;
+
+            keys %all_objs # sic
+        } else {
+            keys %$obj_files # sic
+        }
+    };
 
 # Create edges
     my %obj_needs_objs;
 
-    while (my ($needy_obj, $syms) = each %obj_needs) {
+    while (my ($needy_obj, $syms) = each %$obj_needs) {
         for my $sym (@$syms) {
-            my $providing_obj = $sym_provided_by{$sym};
+            my $providing_obj = $sym_provided_by->{$sym};
             # may be external
             if (defined $providing_obj) {
                 push @{$obj_needs_objs{$needy_obj}}, $providing_obj;
@@ -121,13 +175,13 @@ sub parse_ar_file {
 }
 
 sub write_dot {
-    my ($dot_fn, $V, $E, $ar_fn) = @_;
+    my ($dot_fn, $V, $E, $graph_name) = @_;
 
     my $fh = openFileW($dot_fn);
 
     my @sccs = tarjan_scc($V, $E);
 
-    say $fh 'strict digraph "', basename($ar_fn), '" {';
+    say $fh qq(strict digraph "$graph_name" {);
     say $fh 'rankdir BT';
 
     my $i = 0;
