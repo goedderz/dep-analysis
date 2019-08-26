@@ -9,12 +9,9 @@ use List::Util qw(min any);
 use Getopt::Long;
 
 sub usage {
-    "$0 [ --dot=<output.dot> ] [ --sccs=<output> ] [ --print-external-dependencies ] <library.a> [ <another-library.a> ... ]\n" .
+    "$0 [ --dot=<output.dot> ] [ --sccs=<output> ] [ --print-external-dependencies ] [ --subgraphs=< sccs (default) | archives | none > ] <library.a> [ <another-library.a> ... ]\n" .
     "if neither --dot nor --sccs is given, defaults to --sccs=- (stdout)\n"
 }
-
-# TODO an option that does subgraphs based on the libraries, rather than the
-# sccs, might be nice.
 
 main();
 
@@ -23,10 +20,23 @@ sub main {
     my $scc_fn;
     my $opts = {
         print_external_deps => '',
+        subgraphs => 'sccs',
+    };
+    my @allowed_subgraphs_args = qw(sccs archives none);
+    my $handle_subgraphs = sub {
+        my ($name, $arg) = @_;
+        die "(internal error) Handler for subgraphs called for $name"
+            unless "subgraphs" eq $name;
+        die "Argument to --subgraphs must be one of:\n"
+            . join("", map " - $_\n", @allowed_subgraphs_args)
+            . "but is '$arg'."
+            unless any { $arg eq $_ } @allowed_subgraphs_args;
+        $opts->{subgraphs} = $arg;
     };
     GetOptions (
         "dot=s"  => \$dot_fn,
         "sccs=s"  => \$scc_fn,
+        "subgraphs=s"  => $handle_subgraphs,
         "print-external-dependencies"  => \$opts->{print_external_deps},
     ) or die usage();
 
@@ -40,6 +50,8 @@ sub main {
     @ARGV = ();
 
     my (%obj_files, %obj_needs, %obj_provides, %sym_provided_by);
+
+    my %obj_files_by_archive;
 
     for my $ar_fn (@libraries) {
         # TODO Maybe its better to parse the (possibly non-empty) result hashes
@@ -63,13 +75,15 @@ sub main {
         die "Symbol already encountered, when reading $ar_fn"
             if any { exists $sym_provided_by{$_} } keys %$loc_sym_provided_by;
         @sym_provided_by{keys %$loc_sym_provided_by} = values %$loc_sym_provided_by;
+
+        $obj_files_by_archive{basename($ar_fn)} = [ keys %$loc_obj_files ];
     }
 
     my ($V, $E) = create_graph(\%obj_files, \%obj_needs, \%obj_provides, \%sym_provided_by, $opts);
 
     if (defined $dot_fn) {
         my $graph_name = join ",", map basename($_), @libraries;
-        write_dot($dot_fn, $V, $E, $graph_name);
+        write_dot($dot_fn, $V, $E, \%obj_files_by_archive, $graph_name, $opts);
     }
 
     if (defined $scc_fn) {
@@ -175,25 +189,39 @@ sub create_graph {
 }
 
 sub write_dot {
-    my ($dot_fn, $V, $E, $graph_name) = @_;
+    my ($dot_fn, $V, $E, $obj_files_by_archive, $graph_name, $opts) = @_;
 
     my $fh = openFileW($dot_fn);
-
-    my @sccs = tarjan_scc($V, $E);
 
     say $fh qq(strict digraph "$graph_name" {);
     say $fh 'rankdir BT';
 
-    my $i = 0;
-    for my $scc (@sccs) {
-        ++$i;
-        say $fh "subgraph cluster$i {"
-            if @$scc > 1;
-        for my $v (@$scc) {
-            say $fh qq("$v";);
+    if ($opts->{subgraphs} eq "sccs") {
+        my @sccs = tarjan_scc($V, $E);
+
+        my $i = 0;
+        for my $scc (@sccs) {
+            ++$i;
+            say $fh qq(subgraph "cluster$i" {)
+                if @$scc > 1;
+            for my $v (@$scc) {
+                say $fh qq("$v";);
+            }
+            say $fh "}"
+                if @$scc > 1;
         }
-        say $fh "}"
-            if @$scc > 1;
+    } elsif($opts->{subgraphs} eq "archives") {
+        while (my ($archive, $objs) = each %$obj_files_by_archive) {
+            say $fh qq(subgraph "cluster_$archive" {);
+            for my $v (@$objs) {
+                say $fh qq("$v";);
+            }
+            say $fh "}";
+        }
+    } elsif($opts->{subgraphs} eq "none") {
+        # No subgraphs
+    } else {
+        die "(internal error) Unexpected option to subgraphs: $opts->{subgraphs}";
     }
 
     while (my ($v, $ws) = each %$E) {
